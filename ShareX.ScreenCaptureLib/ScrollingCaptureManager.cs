@@ -15,8 +15,8 @@
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+    along with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
     Optionally you can also view the license at <http://www.gnu.org/licenses/>.
 */
@@ -39,6 +39,10 @@ namespace ShareX.ScreenCaptureLib
         public ScrollingCaptureOptions Options { get; private set; }
         public Bitmap Result { get; private set; }
         public bool IsCapturing { get; private set; }
+
+        private const int ActivationRetryCount = 5;
+        private const int ActivationRetryDelay = 50;
+        private const int ScrollRetryCount = 2;
 
         private Bitmap lastScreenshot;
         private Bitmap previousScreenshot;
@@ -101,9 +105,15 @@ namespace ShareX.ScreenCaptureLib
 
                 try
                 {
-                    selectedWindow.Activate();
+                    if (Options.StartDelay > 0)
+                    {
+                        await Task.Delay(Options.StartDelay);
+                    }
 
-                    await Task.Delay(Options.StartDelay);
+                    if (!await EnsureSelectedWindowActivatedAsync())
+                    {
+                        return status;
+                    }
 
                     if (Options.AutoScrollTop)
                     {
@@ -111,6 +121,11 @@ namespace ShareX.ScreenCaptureLib
                         NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_TOP, 0);
 
                         await Task.Delay(Options.ScrollDelay);
+
+                        if (!await EnsureSelectedWindowActivatedAsync())
+                        {
+                            return status;
+                        }
                     }
 
                     Screenshot screenshot = new Screenshot()
@@ -118,69 +133,28 @@ namespace ShareX.ScreenCaptureLib
                         CaptureCursor = false
                     };
 
+                    previousScreenshot = screenshot.CaptureRectangle(selectedRectangle);
+
+                    if (previousScreenshot == null)
+                    {
+                        return status;
+                    }
+
+                    Result = (Bitmap)previousScreenshot.Clone();
+                    status = ScrollingCaptureStatus.Successful;
+
+                    int scrollRetry = 0;
+
                     while (!stopRequested)
                     {
-                        lastScreenshot = screenshot.CaptureRectangle(selectedRectangle);
-
-                        if (CompareLastTwoImages())
+                        if (!await EnsureSelectedWindowActivatedAsync())
                         {
+                            status = ScrollingCaptureStatus.Failed;
                             break;
-                        }
-
-                        switch (Options.ScrollMethod)
-                        {
-                            case ScrollMethod.MouseWheel:
-                                InputHelpers.SendMouseWheel(-120 * Options.ScrollAmount);
-                                break;
-                            case ScrollMethod.DownArrow:
-                                for (int i = 0; i < Options.ScrollAmount; i++)
-                                {
-                                    InputHelpers.SendKeyPress(VirtualKeyCode.DOWN);
-                                }
-                                break;
-                            case ScrollMethod.PageDown:
-                                InputHelpers.SendKeyPress(VirtualKeyCode.NEXT);
-                                break;
-                            case ScrollMethod.ScrollMessage:
-                                for (int i = 0; i < Options.ScrollAmount; i++)
-                                {
-                                    NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_LINEDOWN, 0);
-                                }
-                                break;
                         }
 
                         Stopwatch timer = Stopwatch.StartNew();
-
-                        if (lastScreenshot != null)
-                        {
-                            Bitmap newResult = await CombineImagesAsync(Result, lastScreenshot);
-
-                            if (newResult != null)
-                            {
-                                Result?.Dispose();
-                                Result = newResult;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-
-                        if (stopRequested)
-                        {
-                            break;
-                        }
-
-                        if (lastScreenshot != null)
-                        {
-                            if (previousScreenshot != null)
-                            {
-                                previousScreenshot.Dispose();
-                            }
-
-                            previousScreenshot = lastScreenshot;
-                            lastScreenshot = null;
-                        }
+                        SendScroll();
 
                         int delay = Options.ScrollDelay - (int)timer.ElapsedMilliseconds;
 
@@ -188,6 +162,57 @@ namespace ShareX.ScreenCaptureLib
                         {
                             await Task.Delay(delay);
                         }
+
+                        if (stopRequested)
+                        {
+                            break;
+                        }
+
+                        lastScreenshot = screenshot.CaptureRectangle(selectedRectangle);
+
+                        if (lastScreenshot == null)
+                        {
+                            status = ScrollingCaptureStatus.Failed;
+                            break;
+                        }
+
+                        if (CompareLastTwoImages())
+                        {
+                            if (scrollRetry < ScrollRetryCount)
+                            {
+                                scrollRetry++;
+                                lastScreenshot.Dispose();
+                                lastScreenshot = null;
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        ScrollingCaptureStatus previousStatus = status;
+                        Bitmap newResult = await CombineImagesAsync(Result, lastScreenshot);
+
+                        if (newResult == null)
+                        {
+                            if (scrollRetry < ScrollRetryCount)
+                            {
+                                status = previousStatus;
+                                scrollRetry++;
+                                lastScreenshot.Dispose();
+                                lastScreenshot = null;
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        Result?.Dispose();
+                        Result = newResult;
+                        scrollRetry = 0;
+
+                        previousScreenshot.Dispose();
+                        previousScreenshot = lastScreenshot;
+                        lastScreenshot = null;
                     }
                 }
                 finally
@@ -221,6 +246,47 @@ namespace ShareX.ScreenCaptureLib
             selectedRectangle = selection.Value.Rectangle;
             selectedWindow = selection.Value.WindowInfo;
             return selectedWindow != null;
+        }
+
+        private async Task<bool> EnsureSelectedWindowActivatedAsync()
+        {
+            for (int i = 0; i < ActivationRetryCount; i++)
+            {
+                if (NativeMethods.GetForegroundWindow() == selectedWindow.Handle)
+                {
+                    return true;
+                }
+
+                selectedWindow.Activate();
+                await Task.Delay(ActivationRetryDelay);
+            }
+
+            return NativeMethods.GetForegroundWindow() == selectedWindow.Handle;
+        }
+
+        private void SendScroll()
+        {
+            switch (Options.ScrollMethod)
+            {
+                case ScrollMethod.MouseWheel:
+                    InputHelpers.SendMouseWheel(-120 * Options.ScrollAmount);
+                    break;
+                case ScrollMethod.DownArrow:
+                    for (int i = 0; i < Options.ScrollAmount; i++)
+                    {
+                        InputHelpers.SendKeyPress(VirtualKeyCode.DOWN);
+                    }
+                    break;
+                case ScrollMethod.PageDown:
+                    InputHelpers.SendKeyPress(VirtualKeyCode.NEXT);
+                    break;
+                case ScrollMethod.ScrollMessage:
+                    for (int i = 0; i < Options.ScrollAmount; i++)
+                    {
+                        NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_LINEDOWN, 0);
+                    }
+                    break;
+            }
         }
 
         private bool IsScrollReachedBottom(IntPtr handle)
